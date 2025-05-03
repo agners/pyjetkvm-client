@@ -8,7 +8,9 @@ from types import TracebackType
 from typing import Any, Self
 
 from aiohttp import ClientSession, CookieJar, WSMsgType
-from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel, RTCConfiguration
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel, RTCConfiguration, RTCIceCandidate
+from aiortc.rtcicetransport import candidate_from_aioice
+from aioice.candidate import Candidate
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
@@ -76,11 +78,13 @@ class JetKVMClient:
 
         # Configure ICE servers (empty list for local-only connections)
         ice_servers = []  # No STUN/TURN servers, local-only connections
-        self.peer_connection = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+        #self.peer_connection = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+        self.peer_connection = RTCPeerConnection()
 
         # Add a dummy video track to match the frontend SDP
         logger.debug("Adding dummy video track...")
-        self.peer_connection.addTransceiver("video", direction="sendrecv")
+        #self.peer_connection.addTransceiver("video", direction="sendrecv")
+        self.peer_connection._sctpLegacySdp = False
         # I think JetKVM requries a application track which is not supported by aiortc...
         # So that is probably why it fails later on.
         #self.peer_connection.addTransceiver("application", direction="sendrecv")
@@ -89,29 +93,49 @@ class JetKVMClient:
         self.rpc_channel = self.peer_connection.createDataChannel("rpc")
         logger.debug("Created RPC data channel.")
 
+        # Event when connection is established
+        connected_event = asyncio.Event()
+
         # Handle the RPC channel
         @self.rpc_channel.on("open")
         def on_open() -> None:
             logger.info("RPC channel is open.")
 
+        @self.rpc_channel.on("message")
+        def on_message(message):
+            logger.debug("RPC message %s", message)
+
+            #if isinstance(message, str) and message.startswith("pong"):
+            #    elapsed_ms = (current_stamp() - int(message[5:])) / 1000
+            #    print(" RTT %.2f ms" % elapsed_ms)
+
+
         @self.rpc_channel.on("close")
         def on_close() -> None:
             logger.warning("RPC channel is closed.")
 
-        @self.peer_connection.on("icecandidate")
-        async def on_icecandidate(event):
-            if event.candidate:
-                logger.debug(f"Sending ICE candidate: {event.candidate}")
-                # Base64 encode the ICE candidate
-                candidate_base64 = base64.b64encode(event.candidate.to_sdp().encode("utf-8")).decode("utf-8")
-                await self.ws.send_json({
-                    "type": "new-ice-candidate",
-                    "data": {
-                        "candidate": candidate_base64,
-                        "sdpMLineIndex": event.candidate.sdpMLineIndex,
-                        "sdpMid": event.candidate.sdpMid,
-                    },
-                })
+
+        # Monitor ICE connection state
+        @self.peer_connection.on("iceconnectionstatechange")
+        async def on_ice_connection_state_change():
+            logger.debug(f"ICE connection state: {self.peer_connection.iceConnectionState}")
+            if self.peer_connection.iceConnectionState == "connected":
+                logger.info("ICE connection established.")
+
+        # Monitor connection state
+        @self.peer_connection.on("connectionstatechange")
+        async def on_connection_state_change():
+            logger.debug(f"Connection state: {self.peer_connection.connectionState}")
+            if self.peer_connection.connectionState == "connected":
+                logger.info("WebRTC connection established.")
+                connected_event.set()
+
+        # Monitor SCTP state
+        @self.peer_connection.sctp.on("statechange")
+        async def on_sctp_state_change():
+            logger.debug(f"SCTP state: {self.peer_connection.sctp.state}")
+            if self.peer_connection.sctp.state == "connected":
+                logger.info("SCTP transport established.")
 
         # Create an SDP offer
         offer: RTCSessionDescription = await self.peer_connection.createOffer()
@@ -137,37 +161,43 @@ class JetKVMClient:
         offer_base64 = base64.b64encode(sdp_json.encode("utf-8")).decode("utf-8")
 
         # Send the SDP offer to the server
-        await asyncio.sleep(1)  # Wait for the server to process the initial message
         await self.ws.send_json({"type": "offer", "data": {"sd": offer_base64}})
         logger.debug("Sent SDP offer to the server: %s.", offer_base64)
 
         # Handle incoming WebSocket messages
-        async for msg in self.ws:
-            logger.debug(f"Received WebSocket message: {msg.data}")
-            if msg.type == WSMsgType.TEXT:
-                data = json.loads(msg.data)
-                if "error" in data:
-                    logger.error(f"Error from server: {data['error']}")
-                    raise RuntimeError("Error from server during WebRTC setup.")
-                if data["type"] == "new-ice-candidate":
-                    # Decode the base64 ICE candidate
-                    candidate_sdp = base64.b64decode(data["data"]["candidate"]).decode("utf-8")
-                    candidate = {
-                        "candidate": candidate_sdp,
-                        "sdpMLineIndex": data["data"]["sdpMLineIndex"],
-                        "sdpMid": data["data"]["sdpMid"],
-                    }
-                    logger.debug(f"Received ICE candidate: {candidate}")
-                    await self.peer_connection.addIceCandidate(candidate)
-                elif data["type"] == "answer":
-                    # Decode the base64 SDP answer
-                    answer_json = json.loads(base64.b64decode(data["data"]).decode("utf-8"))
-                    answer_sdp = answer_json["sdp"]
-                    answer = RTCSessionDescription(sdp=answer_sdp, type="answer")
-                    await self.peer_connection.setRemoteDescription(answer)
-                    logger.debug("Set remote SDP description.")
-                elif data["type"] == "device-metadata":
-                    logger.debug(f"Received device metadata: {data['data']}")
+        async def _handle_signaling():
+            async for msg in self.ws:
+                logger.debug(f"Received WebSocket message: {msg.data}")
+                if msg.type == WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    if "error" in data:
+                        logger.error(f"Error from server: {data['error']}")
+                        raise RuntimeError("Error from server during WebRTC setup.")
+                    if data["type"] == "new-ice-candidate":
+                        # Receive ICE candidate
+                        candidate = Candidate.from_sdp(data["data"]["candidate"])
+                        rtc_candidate = candidate_from_aioice(candidate)
+                        rtc_candidate.sdpMid = data["data"]["sdpMid"]
+                        rtc_candidate.sdpMLineIndex = data["data"]["sdpMLineIndex"]
+                        
+                        logger.debug(f"Received ICE candidate: {rtc_candidate}")
+                        
+                        await self.peer_connection.addIceCandidate(rtc_candidate)
+
+                    elif data["type"] == "answer":
+                        # Decode the base64 SDP answer
+                        answer_json = json.loads(base64.b64decode(data["data"]).decode("utf-8"))
+                        answer_sdp = answer_json["sdp"]
+                        answer = RTCSessionDescription(sdp=answer_sdp, type="answer")
+                        await self.peer_connection.setRemoteDescription(answer)
+                        logger.debug("Set remote SDP description.")
+                elif msg.type == WSMsgType.CLOSE:
+                    logger.warning("WebSocket connection closed.")
+
+                    break
+        self._signaling_task = asyncio.create_task(_handle_signaling())
+        await connected_event.wait()
+        await asyncio.sleep(4)  # Wait for the connection to stabilize
 
     async def send_rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         """Send a JSON-RPC request over the RPC channel."""
@@ -183,9 +213,10 @@ class JetKVMClient:
         }
         logger.debug(f"Sending JSON-RPC request: {request}")
         self.rpc_channel.send(json.dumps(request))
+        await asyncio.sleep(10)  # Give some time for the message to be sent
 
         # Wait for the response
-        response = await self._receive_rpc_response(request_id)
+        #response = await self._receive_rpc_response(request_id)
         if "error" in response:
             logger.error(f"JSON-RPC error: {response['error']}")
             raise ValueError(f"RPC error: {response['error']}")
