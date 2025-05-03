@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=68.0,<80.2", "wheel>=0.40,<0.47"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyjetkvm-client"
+version = "0.0.0"  # to be set by CI on release
+description = "Unofficial Python client for interacting with JetKVM API."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12.0"
+authors = [
+  { name = "Stefan Agner", email = "stefan@agner.ch" }
+]
+keywords = ["jetkvm", "kvm", "client-library", "api", "unofficial"]
+dependencies = [
+  "aiohttp==3.11.18",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.5",
+  "pytest-cov==6.1.1",
+  "pytest-timeout==2.3.1",
+  "mypy==1.10.0",
+  "ruff==0.3.4",
+  "pre-commit==3.7.0",
+  "codespell==2.4.1",
+]
+
+[project.urls]
+"Source Code" = "https://github.com/agners/pyjetkvm-client"
+"Issue Tracker" = "https://github.com/agners/pyjetkvm-client/issues"
+
+[tool.setuptools]
+platforms = ["any"]
+zip-safe = true
+include-package-data = true
+
+[tool.setuptools.package-data]
+"pyjetkvm_client" = ["py.typed"]
+
+[tool.setuptools.packages.find]
+include = ["pyjetkvm_client*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [".git"]
+log_format = "%(asctime)s.%(msecs)03d %(levelname)-8s %(name)s:%(lineno)s %(message)s"
+log_date_format = "%Y-%m-%d %H:%M:%S"
+asyncio_mode = "auto"
+filterwarnings = [
+  "error",
+  "ignore::pytest.PytestUnraisableExceptionWarning",
+]
+
+[tool.ruff]
+lint.select = ["ALL"]
+lint.ignore = [
+  "ANN401", "D203", "D213", "EM", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "TRY003",
+  "COM812", "COM819", "D206", "D300", "E111", "E114", "E117", "ISC001", "ISC002", "Q000", "Q001", "Q002", "Q003", "W191", "T201", "PLR2004"
+]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+section-order = ["future", "standard-library", "third-party", "first-party", "local-folder"]
+forced-separate = ["tests"]
+known-first-party = ["pyjetkvm_client", "tests"]
+combine-as-imports = true
+
+[tool.ruff.lint.mccabe]
+max-complexity = 20
