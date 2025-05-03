@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import dataclasses
 import json
 import logging
 from types import TracebackType
@@ -12,8 +13,6 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, RTCDataChannel, RTC
 from aiortc.rtcicetransport import candidate_from_aioice
 from aioice.candidate import Candidate
 
-# Configure logging
-logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -27,6 +26,8 @@ class JetKVMClient:
         self.peer_connection: RTCPeerConnection | None = None
         self.rpc_channel: RTCDataChannel | None = None
         self.ws: aiohttp.ClientWebSocketResponse | None = None  # Store the WebSocket object
+        self.pending_requests: dict[int, asyncio.Future] = {}
+        self.request_id: int = 0
 
     async def __aenter__(self) -> Self:
         """Enter async context and initialize the HTTP session."""
@@ -41,11 +42,14 @@ class JetKVMClient:
     ) -> None:
         """Exit async context and close all resources."""
         if self.rpc_channel:
-            await self.rpc_channel.close()
+            self.rpc_channel.close()
         if self.peer_connection:
             await self.peer_connection.close()
         if self.ws:
             await self.ws.close()
+        if self._signaling_task:
+            await self._signaling_task
+            self._signaling_task = None
         if self.session:
             await self.session.close()
 
@@ -78,16 +82,15 @@ class JetKVMClient:
 
         # Configure ICE servers (empty list for local-only connections)
         ice_servers = []  # No STUN/TURN servers, local-only connections
-        #self.peer_connection = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
-        self.peer_connection = RTCPeerConnection()
+        self.peer_connection = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+        #self.peer_connection = RTCPeerConnection()
 
-        # Add a dummy video track to match the frontend SDP
-        logger.debug("Adding dummy video track...")
+        # Add a dummy video track to match the frontend SDP (NOT WORKING, why?)
+        #logger.debug("Adding dummy video track...")
         #self.peer_connection.addTransceiver("video", direction="sendrecv")
-        self.peer_connection._sctpLegacySdp = False
-        # I think JetKVM requries a application track which is not supported by aiortc...
-        # So that is probably why it fails later on.
-        #self.peer_connection.addTransceiver("application", direction="sendrecv")
+
+        # This makes the hand-shake closer to what browsers do but works also without it.
+        #self.peer_connection._sctpLegacySdp = False
 
         # Create the RPC data channel
         self.rpc_channel = self.peer_connection.createDataChannel("rpc")
@@ -103,23 +106,32 @@ class JetKVMClient:
 
         @self.rpc_channel.on("message")
         def on_message(message):
-            logger.debug("RPC message %s", message)
-
-            #if isinstance(message, str) and message.startswith("pong"):
-            #    elapsed_ms = (current_stamp() - int(message[5:])) / 1000
-            #    print(" RTT %.2f ms" % elapsed_ms)
+            logger.debug("RPC message received %s: %s", type(message), message)
+            try:
+                response = json.loads(message)
+                request_id = response.get("id")
+                if request_id is not None and request_id in self.pending_requests:
+                    future = self.pending_requests.pop(request_id)
+                    if "error" in response:
+                        future.set_exception(ValueError(f"RPC error: {response['error']}"))
+                    else:
+                        future.set_result(response.get("result"))
+                else:
+                    logger.debug("Received response with non-pending ID: %s", response)
+            except json.JSONDecodeError:
+                logger.error("Failed to decode RPC message: %s", message)
 
 
         @self.rpc_channel.on("close")
         def on_close() -> None:
-            logger.warning("RPC channel is closed.")
+            logger.info("RPC channel is closed.")
 
 
         # Monitor ICE connection state
         @self.peer_connection.on("iceconnectionstatechange")
         async def on_ice_connection_state_change():
             logger.debug(f"ICE connection state: {self.peer_connection.iceConnectionState}")
-            if self.peer_connection.iceConnectionState == "connected":
+            if self.peer_connection.iceConnectionState == "completed":
                 logger.info("ICE connection established.")
 
         # Monitor connection state
@@ -130,39 +142,23 @@ class JetKVMClient:
                 logger.info("WebRTC connection established.")
                 connected_event.set()
 
-        # Monitor SCTP state
-        @self.peer_connection.sctp.on("statechange")
-        async def on_sctp_state_change():
-            logger.debug(f"SCTP state: {self.peer_connection.sctp.state}")
-            if self.peer_connection.sctp.state == "connected":
-                logger.info("SCTP transport established.")
-
         # Create an SDP offer
         offer: RTCSessionDescription = await self.peer_connection.createOffer()
         #offer_sdp = offer.sdp
 
         await self.peer_connection.setLocalDescription(offer)
         offer_sdp = self.peer_connection.localDescription.sdp
-        logger.debug(f"SDP offer: {self.peer_connection.localDescription}")
-
-        # Inject captured offer makes the server answer, obviously, but how can we get this offer correct?
-        #with open("offer.txt", "r") as f:
-        #    offer_sdp = f.read().replace('\n', '\r\n')
-
         logger.debug(f"Created SDP offer: {offer_sdp}")
 
         # Wrap the SDP in a JSON structure
-        sdp_json = json.dumps({
-            "type": "offer",
-            "sdp": offer_sdp,
-        }, separators=(',', ':'))
+        sdp_json = json.dumps(dataclasses.asdict(self.peer_connection.localDescription), separators=(',', ':'))
 
         # Base64 encode the JSON-wrapped SDP
         offer_base64 = base64.b64encode(sdp_json.encode("utf-8")).decode("utf-8")
 
         # Send the SDP offer to the server
         await self.ws.send_json({"type": "offer", "data": {"sd": offer_base64}})
-        logger.debug("Sent SDP offer to the server: %s.", offer_base64)
+        logger.debug("Sent SDP offer to the server.")
 
         # Handle incoming WebSocket messages
         async def _handle_signaling():
@@ -193,8 +189,8 @@ class JetKVMClient:
                         logger.debug("Set remote SDP description.")
                 elif msg.type == WSMsgType.CLOSE:
                     logger.warning("WebSocket connection closed.")
-
                     break
+
         self._signaling_task = asyncio.create_task(_handle_signaling())
         await connected_event.wait()
         await asyncio.sleep(4)  # Wait for the connection to stabilize
@@ -204,32 +200,25 @@ class JetKVMClient:
         if not self.rpc_channel:
             raise RuntimeError("RPC channel is not initialized")
 
-        request_id = 1  # Increment or generate unique IDs as needed
+        self.request_id = self.request_id + 1  # Increment or generate unique IDs as needed
         request = {
             "jsonrpc": "2.0",
             "method": method,
             "params": params,
-            "id": request_id,
+            "id": self.request_id,
         }
         logger.debug(f"Sending JSON-RPC request: {request}")
         self.rpc_channel.send(json.dumps(request))
-        await asyncio.sleep(10)  # Give some time for the message to be sent
+        
+        # Create a Future and store it in the pending requests
+        future = asyncio.Future()
+        self.pending_requests[self.request_id] = future
+
+        # Send the request
+        self.rpc_channel.send(json.dumps(request))
 
         # Wait for the response
-        #response = await self._receive_rpc_response(request_id)
-        if "error" in response:
-            logger.error(f"JSON-RPC error: {response['error']}")
-            raise ValueError(f"RPC error: {response['error']}")
-        logger.debug(f"Received JSON-RPC response: {response}")
-        return response["result"]
-
-    async def _receive_rpc_response(self, request_id: int) -> dict[str, Any]:
-        """Receive and parse the JSON-RPC response."""
-        while True:
-            message = await self.rpc_channel.recv()
-            response = json.loads(message)
-            if response.get("id") == request_id:
-                return response
+        return await future
 
     async def is_setup(self) -> bool:
         """Return True if the JetKVM device is already configured."""
@@ -268,6 +257,31 @@ class JetKVMClient:
         """Retrieve the current DC power state using JSON-RPC."""
         logger.debug("Fetching DC power state...")
         return await self.send_rpc("getDCPowerState", {})
+    
+    async def get_edid(self) -> dict[str, Any]:
+        """Retrieve the EDID data using JSON-RPC."""
+        logger.debug("Fetching EDID data...")
+        return await self.send_rpc("getEDID", {})
+    
+    async def get_video_state(self) -> dict[str, Any]:
+        """Retrieve the current video state using JSON-RPC."""
+        logger.debug("Fetching video state...")
+        return await self.send_rpc("getVideoState", {})
+    
+    async def get_usb_state(self) -> dict[str, Any]:
+        """Retrieve the current USB state using JSON-RPC."""
+        logger.debug("Fetching USB state...")
+        return await self.send_rpc("getUSBState", {})
+    
+    async def get_active_extension(self) -> dict[str, Any]:
+        """Retrieve the currently active extension using JSON-RPC."""
+        logger.debug("Fetching active extension...")
+        return await self.send_rpc("getActiveExtension", {})
+
+    async def get_storage_space(self) -> dict[str, Any]:
+        """Retrieve the storage space information using JSON-RPC."""
+        logger.debug("Fetching storage space information...")
+        return await self.send_rpc("getStorageSpace", {})
 
     async def logout(self) -> dict[str, Any]:
         """Log out of the device and clear session cookies."""

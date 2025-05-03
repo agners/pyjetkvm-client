@@ -3,9 +3,12 @@
 import argparse
 import asyncio
 import getpass
+import logging
 
 from pyjetkvm.client import JetKVMClient
 
+# Configure logging
+logging.basicConfig(level=logging.WARNING)
 
 async def main() -> None:
     """Run the basic usage example."""
@@ -36,8 +39,25 @@ async def main() -> None:
         await client.setup_webrtc()
 
         print("🌐 WebRTC connection established.")
-        dc_power_state = await client.get_dc_power_state()
-        print("DC Power State:", dc_power_state)
+
+        print("💬 Send JSON RPC messages")
+        video = await client.get_video_state()
+        print("Video State:", video)
+
+        usb = await client.get_usb_state()
+        print("USB State:", usb)
+
+        storage_space = await client.get_storage_space()
+        print("Storage Space:", storage_space)
+
+        active_extension = await client.get_active_extension()
+        print("Active Extension:", active_extension)
+
+        if active_extension == "dc-power":
+            dc_power_state = await client.get_dc_power_state()
+            print("DC Power State:", dc_power_state)
+
+
 
 if __name__ == "__main__":
     asyncio.run(main())
