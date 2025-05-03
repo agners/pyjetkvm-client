@@ -29,6 +29,15 @@ async def main() -> None:
         for k, v in device_info.items():
             print(f"  {k}: {v}")
 
+        print("🔌 Setting up WebSocket connection...")
+        await client.setup_ws()
+
+        print("🔌 Setting up WebRTC connection...")
+        await client.setup_webrtc()
+
+        print("🌐 WebRTC connection established.")
+        dc_power_state = await client.get_dc_power_state()
+        print("DC Power State:", dc_power_state)
 
 if __name__ == "__main__":
     asyncio.run(main())
